@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>高精度定位示例（尽量使用 Wi-Fi/GPS）</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 18px; max-width:900px; margin:auto; color:#111; }
+    h1 { font-size:20px; margin-bottom:6px; }
+    .controls { margin:12px 0; }
+    button { padding:8px 12px; margin-right:8px; }
+    table { border-collapse: collapse; width:100%; margin-top:12px; }
+    th,td { border:1px solid #ddd; padding:6px; font-size:13px; }
+    .ok { color:green; }
+    .warn { color:#c60; }
+    #map { height:360px; background:#eee; margin-top:12px; display:flex; align-items:center; justify-content:center; color:#666; }
+    small { color:#666; }
+  </style>
+</head>
+<body>
+  <h1>高精度定位示例（浏览器端，尽量利用 Wi-Fi/GPS）</h1>
+  <p>说明：浏览器会请求定位权限。要达到最好效果，请在设备上开启 Wi-Fi（即使不连网）、在室外或靠近窗户，并在 HTTPS 环境下运行本页。</p>
+
+  <div class="controls">
+    <button id="startBtn">开始定位（多次采样）</button>
+    <button id="stopBtn" disabled>停止</button>
+    <label style="margin-left:10px"><input id="autoStopAcc" type="checkbox" checked /> 自动停止当单次精度 &lt;= <input id="accThreshold" type="number" value="10" style="width:60px" /> 米</label>
+  </div>
+
+  <div>
+    <strong>当前状态：</strong> <span id="status">未开始</span>
+    <div><small>提示：不能保证固定误差 ≤10m；此脚本通过多次采样与加权平均尽量减少随机误差。</small></div>
+  </div>
+
+  <div style="margin-top:12px">
+    <strong>合成位置（加权平均）：</strong>
+    <div id="result">—</div>
+  </div>
+
+  <table id="samplesTable" style="display:none">
+    <thead><tr><th>#</th><th>时间</th><th>纬度</th><th>经度</th><th>精度 (m)</th><th>备注</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <div id="map">地图预览（可接入 Google Maps / Leaflet 以展示）</div>
+
+<script>
+(function(){
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const statusEl = document.getElementById('status');
+  const resultEl = document.getElementById('result');
+  const samplesTable = document.getElementById('samplesTable');
+  const samplesTbody = samplesTable.querySelector('tbody');
+  const autoStopAcc = document.getElementById('autoStopAcc');
+  const accThreshold = document.getElementById('accThreshold');
+
+  let watchId = null;
+  let samples = []; // {lat,lng,accuracy,timestamp}
+  const maxSamples = 12;
+
+  function setStatus(s, cls){
+    statusEl.textContent = s;
+  }
+
+  function addSample(pos){
+    const lat = pos.coords.latitude;
+    const lng = pos.coords.longitude;
+    const acc = pos.coords.accuracy; // meters
+    const ts = new Date(pos.timestamp);
+
+    samples.push({lat,lng,accuracy:acc,timestamp:ts});
+    renderSamples();
+
+    // attempt auto-stop if good accuracy reached
+    if (autoStopAcc.checked && acc <= Number(accThreshold.value)) {
+      stopWatch('达到目标单次精度，已停止采样。');
+    } else if (samples.length >= maxSamples) {
+      stopWatch('达到最大采样次数，已停止。');
+    } else {
+      setStatus(`采样中：已采样 ${samples.length} 次，最近精度 ${acc.toFixed(1)} m`);
+    }
+
+    updateAggregated();
+  }
+
+  function renderSamples(){
+    if (samples.length === 0) {
+      samplesTable.style.display = 'none';
+      samplesTbody.innerHTML = '';
+      return;
+    }
+    samplesTable.style.display = '';
+    samplesTbody.innerHTML = '';
+    samples.forEach((s,i)=>{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${i+1}</td>
+        <td>${s.timestamp.toLocaleTimeString()}</td>
+        <td>${s.lat.toFixed(7)}</td>
+        <td>${s.lng.toFixed(7)}</td>
+        <td>${s.accuracy.toFixed(1)}</td>
+        <td>${s.accuracy <= 10 ? '<span class="ok">高精度</span>' : ''}</td>`;
+      samplesTbody.appendChild(tr);
+    });
+  }
+
+  // 加权平均：权重 = 1 / (accuracy^2)（避免精度为 0 的问题）
+  function weightedAverage(samples){
+    if (!samples.length) return null;
+    let sumW = 0, sumLat = 0, sumLng = 0;
+    for (const s of samples){
+      const a = Math.max(s.accuracy, 1e-1); // 防止 zero
+      const w = 1 / (a * a);
+      sumW += w;
+      sumLat += s.lat * w;
+      sumLng += s.lng * w;
+    }
+    const avgLat = sumLat / sumW;
+    const avgLng = sumLng / sumW;
+
+    // 简单估计合成精度：使用加权 RMS of deviations
+    let sumVarW = 0;
+    for (const s of samples){
+      const d = haversineDistanceMeters(avgLat, avgLng, s.lat, s.lng);
+      sumVarW += (d * d) * (1 / Math.max(s.accuracy,1e-1)); // 权重与上面保持量纲相似
+    }
+    const estimatedStd = Math.sqrt(sumVarW / Math.max(sumW,1));
+    return {lat:avgLat, lng:avgLng, estAccuracy: estimatedStd};
+  }
+
+  // Haversine distance in meters
+  function haversineDistanceMeters(lat1, lon1, lat2, lon2){
+    const R = 6371000;
+    const toRad = Math.PI / 180;
+    const dLat = (lat2 - lat1) * toRad;
+    const dLon = (lon2 - lon1) * toRad;
+    const a = Math.sin(dLat/2)**2 + Math.cos(lat1*toRad)*Math.cos(lat2*toRad)*Math.sin(dLon/2)**2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c;
+  }
+
+  function updateAggregated(){
+    const agg = weightedAverage(samples);
+    if (!agg) {
+      resultEl.textContent = '—';
+      return;
+    }
+    resultEl.innerHTML = `
+      纬度：<strong>${agg.lat.toFixed(7)}</strong>&nbsp;&nbsp;
+      经度：<strong>${agg.lng.toFixed(7)}</strong><br/>
+      估算合成误差（约）： <strong>${agg.estAccuracy.toFixed(1)} m</strong><br/>
+      <small>（精度估算基于样本加权偏差，真实误差可能受设备/环境影响）</small>
+    `;
+    // 可在这里把位置发送到地图或后端
+    // updateMap(agg.lat, agg.lng, agg.estAccuracy);
+  }
+
+  function startWatch(){
+    if (!('geolocation' in navigator)){
+      alert('浏览器不支持定位 API');
+      return;
+    }
+
+    samples = [];
+    renderSamples();
+    setStatus('请求权限与定位…请允许定位，并确保设备已开启 Wi-Fi/GPS（若可用）。');
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+
+    // 高精度选项
+    const options = { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 };
+
+    // 使用 watchPosition 连续采样
+    watchId = navigator.geolocation.watchPosition(
+      pos => {
+        addSample(pos);
+      },
+      err => {
+        console.error('定位错误', err);
+        setStatus('定位错误: ' + (err.message || err.code));
+        // 某些错误下自动停止
+        if (err.code === 1) { // PERMISSION_DENIED
+          stopWatch('用户拒绝定位。');
+        }
+      },
+      options
+    );
+  }
+
+  function stopWatch(msg){
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    }
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (msg) setStatus(msg);
+    else setStatus('已停止采样。');
+    updateAggregated();
+  }
+
+  startBtn.addEventListener('click', startWatch);
+  stopBtn.addEventListener('click', ()=> stopWatch('手动停止。'));
+
+  // 初始提示：必须 HTTPS / localhost
+  if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+    const tip = document.createElement('div');
+    tip.style.background = '#fff3cd';
+    tip.style.border = '1px solid #ffeeba';
+    tip.style.padding = '8px';
+    tip.style.marginTop = '12px';
+    tip.innerHTML = '<strong>注意：</strong>地理定位需在 <code>https</code>（或 <code>localhost</code>）环境下才能正常请求高精度定位权限。';
+    document.body.insertBefore(tip, document.body.children[3]);
+  }
+
+  // （可选）占位 map 更新函数 — 如果你想接入地图 API，可在这里放置 marker 更新代码
+  function updateMap(lat,lng,acc){
+    const mapEl = document.getElementById('map');
+    mapEl.textContent = `位置：${lat.toFixed(6)}, ${lng.toFixed(6)} （约 ${acc.toFixed(1)} m）`;
+    // 若要使用 Google Maps / Leaflet，请把此处替换为相应库的 marker 更新逻辑
+  }
+
+})();
+</script>
+</body>
+</html>
